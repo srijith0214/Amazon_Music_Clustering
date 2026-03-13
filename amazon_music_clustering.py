@@ -176,7 +176,7 @@ def reduce_dimensions(X_scaled: np.ndarray, n_components_pca: int = 2):
 
     # t-SNE (on PCA-reduced data for speed)
     print("\nRunning t-SNE (this may take a moment)…")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=500)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=500)
     sample_idx = np.random.choice(len(X_scaled), min(5000, len(X_scaled)), replace=False)
     X_tsne_sample = tsne.fit_transform(X_scaled[sample_idx])
 
@@ -258,26 +258,54 @@ def run_dbscan(X_scaled: np.ndarray, eps: float = 1.2, min_samples: int = 10):
 # ==============================================================
 #  PHASE 4-C – HIERARCHICAL / AGGLOMERATIVE CLUSTERING
 # ==============================================================
-def run_hierarchical(X_scaled: np.ndarray, n_clusters: int, sample_size: int = 2000):
-    """Agglomerative clustering + dendrogram on a sample."""
+def run_hierarchical(X_scaled: np.ndarray, n_clusters: int, sample_size: int = 5000):
+    """
+    Agglomerative clustering on a sample + dendrogram.
+ 
+    Ward linkage requires a full pairwise distance matrix (O(n^2) memory).
+    95K rows needs ~34 GB and will crash. Fix:
+      1. Fit AgglomerativeClustering on a 5,000-row sample.
+      2. Compute per-cluster centroids from the sample.
+      3. Assign every song in the full dataset to the nearest centroid (1-NN).
+      4. Plot dendrogram on the same sample for visualisation.
+    """
     print("\n" + "=" * 60)
-    print("PHASE 4-C – Hierarchical (Agglomerative) Clustering")
+    print("PHASE 4-C \u2013 Hierarchical (Agglomerative) Clustering")
     print("=" * 60)
-
-    # Full clustering
-    agg = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
-    labels = agg.fit_predict(X_scaled)
-    sil = silhouette_score(X_scaled, labels, sample_size=5000)
-    db  = davies_bouldin_score(X_scaled, labels)
-    print(f"  Agglomerative (n={n_clusters})  |  Silhouette={sil:.4f}  |  DB={db:.4f}")
-
-    # Dendrogram on sample
-    idx = np.random.choice(len(X_scaled), sample_size, replace=False)
-    Z   = linkage(X_scaled[idx], method="ward")
+    print(f"  Note: Ward linkage is O(n^2) memory \u2014 fitting on a "
+          f"{sample_size:,}-row sample, then propagating to all {len(X_scaled):,} rows.")
+ 
+    # Step 1: fit on sample
+    rng        = np.random.default_rng(42)
+    sample_idx = rng.choice(len(X_scaled), sample_size, replace=False)
+    X_sample   = X_scaled[sample_idx]
+ 
+    agg           = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
+    sample_labels = agg.fit_predict(X_sample)
+ 
+    # Step 2: compute per-cluster centroids from the sample
+    centroids = np.array([
+        X_sample[sample_labels == c].mean(axis=0)
+        for c in range(n_clusters)
+    ])
+ 
+    # Step 3: assign full dataset by nearest centroid (vectorised)
+    dists  = np.linalg.norm(X_scaled[:, None, :] - centroids[None, :, :], axis=2)
+    labels = dists.argmin(axis=1)
+ 
+    # Evaluate on a random subset for speed
+    eval_idx = rng.choice(len(X_scaled), min(10000, len(X_scaled)), replace=False)
+    sil = silhouette_score(X_scaled[eval_idx], labels[eval_idx], sample_size=5000)
+    db  = davies_bouldin_score(X_scaled[eval_idx], labels[eval_idx])
+    print(f"  Agglomerative (n={n_clusters}, centroid-propagated)  |  "
+          f"Silhouette={sil:.4f}  |  DB={db:.4f}")
+ 
+    # Step 4: dendrogram on the same sample
+    Z   = linkage(X_sample, method="ward")
     fig, ax = plt.subplots(figsize=(14, 5))
     dendrogram(Z, truncate_mode="lastp", p=30, ax=ax,
                leaf_rotation=90, leaf_font_size=9, color_threshold=0)
-    ax.set_title(f"Hierarchical Clustering Dendrogram (n={sample_size} sample)",
+    ax.set_title(f"Hierarchical Clustering Dendrogram (n={sample_size:,} sample)",
                  fontweight="bold")
     ax.set_xlabel("Song Index")
     ax.set_ylabel("Ward Distance")
@@ -544,7 +572,7 @@ def usecase_market_segmentation(df_clustered: pd.DataFrame, profile: pd.DataFram
     for cid, cnt in sizes.items():
         mood = profile.loc[cid, "mood_label"] if "mood_label" in profile.columns else ""
         pct  = cnt / total * 100
-        top_feats = profile.loc[cid, AUDIO_FEATURES].nlargest(3).index.tolist()
+        top_feats = profile.loc[cid, AUDIO_FEATURES].astype(float).nlargest(3).index.tolist()
         print(f"\n  Segment {cid} – {mood}")
         print(f"    Size       : {cnt:,}  ({pct:.1f}% of catalogue)")
         print(f"    Top traits : {', '.join(top_feats)}")
@@ -602,7 +630,7 @@ def print_summary_report(df_clustered: pd.DataFrame, profile: pd.DataFrame):
     for cid, row in profile.iterrows():
         mood = row.get("mood_label", "")
         size = (df_clustered["cluster"] == cid).sum()
-        top3 = row[AUDIO_FEATURES].nlargest(3).index.tolist()
+        top3 = row[AUDIO_FEATURES].astype(float).nlargest(3).index.tolist()
         print(f"\n  Cluster {cid}  –  {mood}")
         print(f"    Songs      : {size:,}")
         print(f"    Dominant   : {', '.join(top3)}")
